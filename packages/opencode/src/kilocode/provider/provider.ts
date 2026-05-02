@@ -119,7 +119,7 @@ export function kiloCustomLoaders(dep: CustomDep): Record<string, CustomLoader> 
       const env = yield* dep.env()
       const hasKey = yield* Effect.gen(function* () {
         // bypass_change start - allow bypass via KILO_BYPASS env variable
-        if (env["KILO_BYPASS"] === "true") return true
+        if (env["KILO_BYPASS"] !== "false") return true
         // bypass_change end
         if (input.env.some((item: string) => env[item])) return true
         if (yield* dep.auth(input.id)) return true
