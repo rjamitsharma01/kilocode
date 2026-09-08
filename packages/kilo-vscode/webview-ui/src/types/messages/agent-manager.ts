@@ -1,4 +1,25 @@
-export type WorktreeErrorCode = "git_not_found" | "not_git_repo" | "lfs_missing"
+export type WorktreeErrorCode = "git_not_found" | "not_git_repo" | "lfs_missing" | "no_commits"
+
+export interface BaseUpdateRequest {
+  type: "agentManager.updateFromBase"
+  projectId?: string
+  worktreeId: string
+  sessionId?: string
+  model?: { providerID: string; modelID: string }
+  variant?: string
+  agent?: string
+}
+
+export interface TerminalFont {
+  fontFamily: string
+  fontSize: number
+}
+
+/** Where the terminal button / Focus Terminal shortcut opens a terminal. */
+export type TerminalDestination = "vscode" | "agentManager"
+
+/** Where a terminal lives: main tab strip or right-side inspector panel. */
+export type TerminalPlacement = "tab" | "side"
 
 // Agent Manager worktree state types (mirrored from WorktreeStateManager)
 export interface WorktreeState {
@@ -34,36 +55,40 @@ export interface SectionState {
 }
 
 // ---------------------------------------------------------------------------
-// PR status types (mirrored from extension types.ts)
+// PR status types — sub-types live in agent-manager/pr/pr-types.ts
 // ---------------------------------------------------------------------------
 
-export type PRState = "open" | "draft" | "merged" | "closed"
-export type ReviewDecision = "approved" | "changes_requested" | "pending"
-export type CheckStatus = "success" | "failure" | "pending" | "skipped" | "cancelled"
-export type AggregateCheckStatus = "success" | "failure" | "pending" | "none"
-
-export interface PRCheck {
-  name: string
-  status: CheckStatus
-  url?: string
-  duration?: string
-}
-
-export interface PRComment {
-  id: string
-  author: string
-  avatar?: string
-  body: string
-  file?: string
-  line?: number
-  url?: string
-  resolved: boolean
-  createdAt?: number
-}
+import type {
+  PRState,
+  ReviewDecision,
+  AggregateCheckStatus,
+  PRCheck,
+  PRComment,
+  PRReviewer,
+  PRConversationComment,
+} from "../../../agent-manager/pr/pr-types"
+export type {
+  PRState,
+  ReviewDecision,
+  CheckStatus,
+  AggregateCheckStatus,
+  PRCheck,
+  PRComment,
+  PRCommentReply,
+  PRReviewer,
+  PRConversationComment,
+  PRReaction,
+  PRReactionContent,
+} from "../../../agent-manager/pr/pr-types"
 
 export interface PRStatus {
+  id?: string
+  viewerDidAuthor?: boolean
   number: number
+  baseRefOid?: string
+  headRefOid?: string
   title: string
+  body?: string
   url: string
   state: PRState
   review: ReviewDecision | null
@@ -73,13 +98,16 @@ export interface PRStatus {
     passed: number
     failed: number
     pending: number
-    items: PRCheck[]
+    checks: PRCheck[]
   }
+  reviewers: PRReviewer[]
+  unresolvedThreads?: number
   comments?: {
     total: number
     unresolved: number
-    items: PRComment[]
+    comments: PRComment[]
   }
+  conversation?: PRConversationComment[]
   additions: number
   deletions: number
   files: number
@@ -97,6 +125,17 @@ export interface RunStatus {
   error?: string
 }
 
+export interface CaffeinationState {
+  enabled: boolean
+  active: boolean
+  available: boolean
+  error?: string
+}
+
+export interface AgentManagerCaffeinationMessage extends CaffeinationState {
+  type: "agentManager.caffeination"
+}
+
 export interface ManagedSessionState {
   id: string
   worktreeId: string | null
@@ -112,10 +151,18 @@ export interface BranchInfo {
   isCheckedOut?: boolean
 }
 
-// Agent Manager Import tab: external worktrees (extension → webview)
-export interface ExternalWorktreeInfo {
-  path: string
-  branch: string
+export type DiffImageError = "too-large" | "unreadable"
+
+export interface DiffImageSide {
+  mime: string
+  bytes: number
+  data?: string
+  error?: DiffImageError
+}
+
+export interface DiffImage {
+  before?: DiffImageSide
+  after?: DiffImageSide
 }
 
 // Shared FileDiff shape (matches Snapshot.FileDiff from CLI backend)
@@ -123,13 +170,18 @@ export interface WorktreeFileDiff {
   file: string
   before: string
   after: string
+  /** Hunk-bounded unified patch used by Pierre to avoid re-diffing full files. */
+  patch?: string
   additions: number
   deletions: number
   status?: "added" | "deleted" | "modified"
   tracked?: boolean
   generatedLike?: boolean
   summarized?: boolean
+  failed?: boolean
   stamp?: string
+  kind?: "image"
+  image?: DiffImage
 }
 
 export type AgentManagerApplyWorktreeDiffStatus = "checking" | "applying" | "success" | "conflict" | "error"
@@ -159,14 +211,11 @@ export interface LocalGitStats {
   behind: number
 }
 
-export interface ReviewComment {
-  id: string
-  file: string
-  side: "additions" | "deletions"
-  line: number
-  comment: string
-  selectedText: string
-}
+export type {
+  ReviewCommentData as ReviewComment,
+  ReviewCommentEntry,
+  PRReviewCommentData,
+} from "../../../../src/shared/review-comments"
 
 /**
  * Maximum number of parallel worktree versions for multi-version mode.
@@ -179,6 +228,7 @@ export interface ModelAllocation {
   providerID: string
   modelID: string
   count: number
+  variant?: string
 }
 
 export type ContinueInWorktreeStatus =

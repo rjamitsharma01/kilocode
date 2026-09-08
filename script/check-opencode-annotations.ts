@@ -5,8 +5,9 @@
  * is annotated with a kilocode_change marker.
  *
  * Usage:
- *   bun run script/check-opencode-annotations.ts                  # diff against origin/main
- *   bun run script/check-opencode-annotations.ts --base <ref>     # diff against <ref>
+ *   bun run script/check-opencode-annotations.ts                  # diff origin/main...HEAD
+ *   bun run script/check-opencode-annotations.ts --base <ref>     # diff <ref>...HEAD
+ *   bun run script/check-opencode-annotations.ts --worktree       # diff HEAD..worktree plus untracked files
  *
  * A line is "covered" if it:
  *   - contains a kilocode_change marker comment           (inline annotation)
@@ -35,13 +36,15 @@ import path from "node:path"
 const ROOT = path.resolve(import.meta.dir, "..")
 const SOURCE_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".yml", ".yaml", ".toml", ".sh", ".bash", ".zsh"])
 const SCOPES = [
-  "sdks/vscode",
   "packages/opencode",
+  "packages/core",
+  "packages/llm",
+  "packages/schema",
+  "packages/protocol",
+  "packages/server",
+  "packages/tui",
   "packages/extensions",
   "packages/ui",
-  "packages/app",
-  "packages/desktop",
-  "packages/desktop-electron",
   "packages/shared",
   "packages/script",
   "packages/storybook",
@@ -54,11 +57,28 @@ const EXEMPT_SCOPES = [
   "script/check-opencode-annotations.ts",
   "packages/script/tests/check-opencode-annotations.test.ts",
   ".github/workflows/check-opencode-annotations.yml",
+  ".github/workflows/watch-opencode-releases.yml",
 ]
 
 const args = process.argv.slice(2)
+const unknown = args.find((arg, i) => arg !== "--base" && arg !== "--worktree" && args[i - 1] !== "--base")
+if (unknown) {
+  console.error(`Unknown argument: ${unknown}`)
+  process.exit(1)
+}
 const baseIdx = args.indexOf("--base")
-const base = baseIdx !== -1 ? args[baseIdx + 1] : "origin/main"
+const worktree = args.includes("--worktree")
+if (worktree && baseIdx !== -1) {
+  console.error("--base cannot be used with --worktree")
+  process.exit(1)
+}
+const base = (() => {
+  if (baseIdx === -1) return "origin/main"
+  const ref = args[baseIdx + 1]
+  if (ref && !ref.startsWith("--")) return ref
+  console.error("Missing value for --base")
+  process.exit(1)
+})()
 
 function run(cmd: string, args: string[]) {
   const result = spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8" })
@@ -70,9 +90,21 @@ function run(cmd: string, args: string[]) {
   return result.stdout?.trim() ?? ""
 }
 
-function changedFiles() {
-  const out = run("git", ["diff", "--name-only", "--diff-filter=AMRT", `${base}...HEAD`, "--", ...SCOPES])
+const ref = worktree ? "HEAD" : `${base}...HEAD`
+
+function lines(out: string) {
   return out ? out.split("\n").filter(Boolean) : []
+}
+
+function untracked(file?: string) {
+  if (!worktree) return []
+  const pathspec = file ? [file] : SCOPES
+  return lines(run("git", ["ls-files", "--others", "--exclude-standard", "--", ...pathspec]))
+}
+
+function changedFiles() {
+  const out = run("git", ["diff", "--name-only", "--diff-filter=AMRT", ref, "--", ...SCOPES])
+  return [...new Set([...lines(out), ...untracked()])]
 }
 
 function isUpstreamMerge() {
@@ -81,7 +113,9 @@ function isUpstreamMerge() {
     const [parents = "", subject = ""] = line.split("\t")
     if (!parents.includes(" ")) return false
     const s = subject.toLowerCase()
-    return s.startsWith("merge: upstream ") || s.startsWith("resolve merge conflict")
+    return (
+      s.startsWith("merge: upstream ") || s.startsWith("merge: opencode ") || s.startsWith("resolve merge conflict")
+    )
   })
 }
 
@@ -103,17 +137,56 @@ function isSource(file: string) {
   return content(file).startsWith("#!") // kilocode_change
 }
 
-function addedLines(file: string): Set<number> {
-  const diff = run("git", ["diff", "--unified=0", "--diff-filter=AMRT", `${base}...HEAD`, "--", file])
-  const out = new Set<number>()
-  for (const line of diff.split("\n")) {
-    const m = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/)
-    if (!m) continue
-    const start = Number(m[1])
-    const count = m[2] !== undefined ? Number(m[2]) : 1
-    for (let i = 0; i < count; i++) out.add(start + i)
+// Parses the unified=0 diff for `file` against the selected target and returns:
+//   - added: every added line number on the checked version
+//   - revert: true when the file's diff removes any kilocode_change marker.
+//     In that case the changes are reverting Kilo modifications back to the
+//     upstream baseline, so newly added lines (which are restoring upstream
+//     content) should not require a marker. Refs that depended on a removed
+//     Kilo construct (e.g. `unixSkip(` → `unix(`) often live in different
+//     hunks than the marker itself, so we use file-level detection rather
+//     than hunk-level to avoid false positives on legitimate reverts.
+function addedLines(file: string): { added: Set<number>; revert: boolean } {
+  const added = new Set<number>()
+  if (untracked(file).includes(file)) {
+    const text = content(file)
+    const count = text.split(/\r?\n/).length
+    for (const n of Array.from({ length: count }, (_, i) => i + 1)) added.add(n)
+    return { added, revert: false }
   }
-  return out
+
+  const diff = run("git", ["diff", "--unified=0", "--diff-filter=AMRT", ref, "--", file])
+  let revert = false
+  const all = diff.split("\n")
+
+  let i = 0
+  while (i < all.length) {
+    const header = all[i] ?? ""
+    const m = header.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/)
+    if (!m) {
+      i++
+      continue
+    }
+
+    const start = Number(m[1])
+    let pos = 0
+    let j = i + 1
+    while (j < all.length) {
+      const hl = all[j] ?? ""
+      if (hl.startsWith("@@") || hl.startsWith("diff ")) break
+      if (hl.startsWith("+") && !hl.startsWith("+++")) {
+        added.add(start + pos)
+        pos++
+      } else if (hl.startsWith("-") && !hl.startsWith("---") && hasMarker(hl.slice(1))) {
+        revert = true
+      }
+      j++
+    }
+
+    i = j
+  }
+
+  return { added, revert }
 }
 
 // kilocode_change start
@@ -177,7 +250,7 @@ function coveredLines(text: string): { lines: string[]; covered: Set<number> } {
 
 // --- main ---
 
-if (isUpstreamMerge()) {
+if (!worktree && isUpstreamMerge()) {
   console.log("Skipping shared upstream annotation check — upstream merge detected.")
   process.exit(0)
 }
@@ -192,13 +265,14 @@ if (files.length === 0) {
 const violations: string[] = []
 
 for (const file of files) {
-  const nums = addedLines(file)
-  if (nums.size === 0) continue
+  const { added, revert } = addedLines(file)
+  if (added.size === 0) continue
+  if (revert) continue // kilocode_change - file is reverting Kilo modifications back to upstream
 
   const text = content(file) // kilocode_change
   const { lines, covered } = coveredLines(text)
 
-  for (const n of nums) {
+  for (const n of added) {
     const line = lines[n - 1] ?? ""
     const trim = line.trim()
     if (!trim) continue

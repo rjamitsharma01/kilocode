@@ -1,10 +1,10 @@
-import type { Ignore } from "ignore"
 import path from "path"
 
 import { getDefaultModelId } from "./model-registry"
 import { resolveEmbeddingProfile } from "./embedding-profile"
 
 import { OpenAiEmbedder } from "./embedders/openai"
+import { KiloEmbedder } from "./embedders/kilo"
 import { CodeIndexOllamaEmbedder } from "./embedders/ollama"
 import { OpenAICompatibleEmbedder } from "./embedders/openai-compatible"
 import { GeminiEmbedder } from "./embedders/gemini"
@@ -15,24 +15,44 @@ import { OpenRouterEmbedder } from "./embedders/openrouter"
 import { VoyageEmbedder } from "./embedders/voyage"
 import { QdrantVectorStore } from "./vector-store/qdrant-client"
 import { LanceDBVectorStore } from "./vector-store/lancedb-vector-store"
-import { codeParser, DirectoryScanner, FileWatcher } from "./processors"
-import type { ICodeParser, IEmbedder, IFileWatcher, IVectorStore } from "./interfaces"
+import { CodeParser, DirectoryScanner, FileWatcher } from "./processors"
+import type { AvailableEmbedders, ICodeParser, IEmbedder, IFileWatcher, IVectorStore } from "./interfaces"
 import type { CodeIndexConfigManager } from "./config-manager"
 import type { CacheManager } from "./cache-manager"
 import type { IndexingTelemetryMeta, IndexingTelemetryReporter } from "./interfaces/telemetry"
 import {
   BATCH_SEGMENT_THRESHOLD,
+  DEFAULT_VECTOR_STORE,
   OLLAMA_EMBEDDER_REQUEST_TIMEOUT_MS,
   REMOTE_EMBEDDER_VALIDATION_TIMEOUT_MS,
 } from "./constants"
 import { Log } from "../util/log"
+import type { IgnoreMatcher } from "./shared/load-ignore"
 
 const log = Log.create({ service: "indexing-factory" })
 
-function timeout(provider: string): number {
-  if (provider === "ollama") return OLLAMA_EMBEDDER_REQUEST_TIMEOUT_MS
-  return REMOTE_EMBEDDER_VALIDATION_TIMEOUT_MS
-}
+// RATIONALE: The OpenAI SDK applies the per-attempt timeout and retries internally.
+const policy = {
+  openai: undefined,
+  openrouter: undefined,
+  "openai-compatible": undefined,
+  kilo: undefined,
+  gemini: undefined,
+  mistral: undefined,
+  "vercel-ai-gateway": undefined,
+  ollama: {
+    timeout: OLLAMA_EMBEDDER_REQUEST_TIMEOUT_MS,
+    error: "Connection to embedding service failed (timeout)",
+  },
+  voyage: {
+    timeout: REMOTE_EMBEDDER_VALIDATION_TIMEOUT_MS,
+    error: "Connection failed. Please check the endpoint URL and network connectivity.",
+  },
+  bedrock: {
+    timeout: REMOTE_EMBEDDER_VALIDATION_TIMEOUT_MS,
+    error: "Connection failed. Please check the endpoint URL and network connectivity.",
+  },
+} satisfies Record<AvailableEmbedders, { timeout: number; error: string } | undefined>
 
 /**
  * Factory class responsible for creating and configuring code indexing service dependencies.
@@ -54,7 +74,7 @@ export class CodeIndexServiceFactory {
     const cfg = this.configManager.getConfig()
     return {
       provider: cfg.embedderProvider,
-      vectorStore: cfg.vectorStoreProvider ?? "qdrant",
+      vectorStore: cfg.vectorStoreProvider ?? DEFAULT_VECTOR_STORE,
       modelId: cfg.modelId,
     }
   }
@@ -63,6 +83,17 @@ export class CodeIndexServiceFactory {
     const config = this.configManager.getConfig()
     const provider = config.embedderProvider
 
+    if (provider === "kilo") {
+      if (!config.kiloOptions?.apiKey) throw new Error("Kilo API key is required for embedding.")
+      if (!config.modelId) throw new Error("Kilo embedding model is required.")
+      return new KiloEmbedder({
+        apiKey: config.kiloOptions.apiKey,
+        baseUrl: config.kiloOptions.baseUrl,
+        organizationId: config.kiloOptions.organizationId,
+        modelId: config.modelId,
+        dimensions: config.modelDimension,
+      })
+    }
     if (provider === "openai") {
       if (!config.openAiOptions?.apiKey) throw new Error("OpenAI API key is required for embedding.")
       return new OpenAiEmbedder(config.openAiOptions.apiKey, config.modelId)
@@ -72,8 +103,7 @@ export class CodeIndexServiceFactory {
       return new CodeIndexOllamaEmbedder(config.ollamaOptions.baseUrl, config.modelId, config.modelDimension)
     }
     if (provider === "openai-compatible") {
-      if (!config.openAiCompatibleOptions?.baseUrl || !config.openAiCompatibleOptions?.apiKey)
-        throw new Error("OpenAI-compatible base URL and API key are required.")
+      if (!config.openAiCompatibleOptions?.baseUrl) throw new Error("OpenAI-compatible base URL is required.")
       return new OpenAICompatibleEmbedder(
         config.openAiCompatibleOptions.baseUrl,
         config.openAiCompatibleOptions.apiKey,
@@ -116,26 +146,26 @@ export class CodeIndexServiceFactory {
   }
 
   public async validateEmbedder(embedder: IEmbedder): Promise<{ valid: boolean; error?: string }> {
-    const ms = timeout(embedder.embedderInfo.name)
+    const deadline = policy[embedder.embedderInfo.name]
     let timer: ReturnType<typeof setTimeout> | undefined
     const wait = embedder.validateConfiguration()
-    const fail = new Promise<{ valid: boolean; error?: string }>((resolve) => {
-      timer = setTimeout(
-        () =>
-          resolve({
-            valid: false,
-            error:
-              embedder.embedderInfo.name === "ollama"
-                ? "Connection to embedding service failed (timeout)"
-                : "Connection failed. Please check the endpoint URL and network connectivity.",
-          }),
-        ms,
-      )
-    })
+    const fail =
+      deadline === undefined
+        ? undefined
+        : new Promise<{ valid: boolean; error?: string }>((resolve) => {
+            timer = setTimeout(
+              () =>
+                resolve({
+                  valid: false,
+                  error: deadline.error,
+                }),
+              deadline.timeout,
+            )
+          })
 
     try {
       log.info("validating embedder", { provider: embedder.embedderInfo.name })
-      const result = await Promise.race([wait, fail])
+      const result = fail ? await Promise.race([wait, fail]) : await wait
       if (result.valid) {
         log.info("embedder validation succeeded", { provider: embedder.embedderInfo.name })
       }
@@ -157,7 +187,7 @@ export class CodeIndexServiceFactory {
     }
   }
 
-  public createVectorStore(): IVectorStore {
+  public createVectorStore(workspacePath = this.workspacePath): IVectorStore {
     const config = this.configManager.getConfig()
     const profile = resolveEmbeddingProfile(config.embedderProvider, config.modelId, config.modelDimension)
 
@@ -179,7 +209,7 @@ export class CodeIndexServiceFactory {
         vectorSize: profile.dimension,
         dbDir,
       })
-      return new LanceDBVectorStore(this.workspacePath, profile.dimension, dbDir, profile)
+      return new LanceDBVectorStore(workspacePath, profile.dimension, dbDir, profile)
     }
 
     if (!config.qdrantUrl) throw new Error("Qdrant URL is required.")
@@ -189,14 +219,14 @@ export class CodeIndexServiceFactory {
       model: profile.modelId,
       vectorSize: profile.dimension,
     })
-    return new QdrantVectorStore(this.workspacePath, config.qdrantUrl, profile.dimension, config.qdrantApiKey, profile)
+    return new QdrantVectorStore(workspacePath, config.qdrantUrl, profile.dimension, config.qdrantApiKey, profile)
   }
 
   public createDirectoryScanner(
     embedder: IEmbedder,
     vectorStore: IVectorStore,
     parser: ICodeParser,
-    ignoreInstance: Ignore,
+    ignoreInstance: IgnoreMatcher,
   ): DirectoryScanner {
     const config = this.configManager.getConfig()
     const meta = this.getTelemetryMeta()
@@ -210,6 +240,7 @@ export class CodeIndexServiceFactory {
       config.scannerMaxBatchRetries,
       this.onTelemetry,
       meta,
+      config.fileExtensions,
     )
   }
 
@@ -217,7 +248,8 @@ export class CodeIndexServiceFactory {
     embedder: IEmbedder,
     vectorStore: IVectorStore,
     cacheManager: CacheManager,
-    ignoreInstance: Ignore,
+    ignoreInstance: IgnoreMatcher,
+    parser: ICodeParser,
   ): IFileWatcher {
     const config = this.configManager.getConfig()
     const meta = this.getTelemetryMeta()
@@ -231,12 +263,14 @@ export class CodeIndexServiceFactory {
       config.scannerMaxBatchRetries,
       this.onTelemetry,
       meta,
+      config.fileExtensions,
+      parser,
     )
   }
 
   public createServices(
     cacheManager: CacheManager,
-    ignoreInstance: Ignore,
+    ignoreInstance: IgnoreMatcher,
   ): {
     embedder: IEmbedder
     vectorStore: IVectorStore
@@ -259,9 +293,9 @@ export class CodeIndexServiceFactory {
 
     const embedder = this.createEmbedder()
     const vectorStore = this.createVectorStore()
-    const parser = codeParser
+    const parser = new CodeParser(config.fileExtensions)
     const scanner = this.createDirectoryScanner(embedder, vectorStore, parser, ignoreInstance)
-    const fileWatcher = this.createFileWatcher(embedder, vectorStore, cacheManager, ignoreInstance)
+    const fileWatcher = this.createFileWatcher(embedder, vectorStore, cacheManager, ignoreInstance, parser)
 
     log.info("indexing services created", {
       workspacePath: this.workspacePath,

@@ -74,6 +74,10 @@ const realArgs = await import("@tui/context/args")
 const realSdk = await import("@tui/context/sdk")
 const realProject = await import("@tui/context/project")
 const realToast = await import("@tui/ui/toast")
+const realEvent = await import("@tui/context/event")
+const realRoute = await import("@tui/context/route")
+const realRuntime = await import("@tui/context/runtime")
+const realPermission = await import("@tui/context/permission")
 
 let capturedInit: (() => any) | undefined
 
@@ -93,6 +97,7 @@ mock.module("@tui/context/sync", () => ({
       provider_default: { anthropic: "claude-sonnet" },
       agent: mockAgents,
       config: mockConfig,
+      session: [],
       mcp: {},
     },
   }),
@@ -127,6 +132,9 @@ mock.module("@tui/context/sdk", () => ({
         connect: async () => {},
       },
     },
+    event: {
+      on: () => () => {},
+    },
   }),
 }))
 
@@ -152,13 +160,38 @@ mock.module("@tui/ui/toast", () => ({
   useToast: () => toastMock,
 }))
 
+mock.module("@tui/context/event", () => ({
+  ...realEvent,
+  useEvent: () => ({ onSync: () => () => {} }),
+}))
+
+mock.module("@tui/context/route", () => ({
+  ...realRoute,
+  useRoute: () => ({ data: { type: "home" }, navigate: () => {} }),
+}))
+
+mock.module("@tui/context/permission", () => ({
+  ...realPermission,
+  usePermission: () => ({ mode: "normal", set: () => {}, toggle: () => {} }),
+}))
+
+// Import the real Global to get the state path (set by test preload via XDG_STATE_HOME)
+const { Global } = await import("@opencode-ai/core/global")
+const modelJsonPath = path.join(Global.Path.state, "model.json")
+
+mock.module("@tui/context/runtime", () => ({
+  ...realRuntime,
+  useTuiPaths: () => ({
+    cwd: process.cwd(),
+    home: Global.Path.home,
+    state: Global.Path.state,
+    worktree: process.cwd(),
+  }),
+}))
+
 // ── Import under test (after mocks) ────────────────────────────────────────
 
 await import("@tui/context/local")
-
-// Import the real Global to get the state path (set by test preload via XDG_STATE_HOME)
-const { Global } = await import("@/global")
-const modelJsonPath = path.join(Global.Path.state, "model.json")
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -252,7 +285,7 @@ describe("model.set persists per-agent model", () => {
     const { local, dispose } = await initLocal()
     try {
       local.model.set(OPUS, { recent: true })
-      await Bun.sleep(50)
+      await local.model.flush()
 
       const data = await readModelJson()
       expect(data.model.code).toEqual(OPUS)
@@ -269,7 +302,7 @@ describe("model.set persists per-agent model", () => {
       local.model.set(SONNET, { recent: true })
       local.agent.set("plan")
       local.model.set(OPUS, { recent: true })
-      await Bun.sleep(50)
+      await local.model.flush()
 
       const data = await readModelJson()
       expect(data.model.code).toEqual(SONNET)
@@ -286,7 +319,7 @@ describe("model.set persists per-agent model", () => {
       const deadline = Date.now() + 2000
       while (!local.model.ready && Date.now() < deadline) await Bun.sleep(10)
       local.model.set(OPUS, { recent: true })
-      await Bun.sleep(50)
+      await local.model.flush()
       dispose()
     }
 
@@ -306,7 +339,7 @@ describe("model.set persists per-agent model", () => {
 
       // Setting a new model on top of loaded data should produce correct file
       local.model.set(SONNET, { recent: true })
-      await Bun.sleep(50)
+      await local.model.flush()
       const data2 = await readModelJson()
       expect(data2.model.code).toEqual(SONNET)
       expect(data2.recent[0]).toEqual(SONNET)
@@ -328,7 +361,7 @@ describe("model.cycle and model.cycleFavorite", () => {
     })
     try {
       local.model.cycle(1)
-      await Bun.sleep(50)
+      await local.model.flush()
 
       const data = await readModelJson()
       expect(data.model.code).toEqual(OPUS)
@@ -348,7 +381,7 @@ describe("model.cycle and model.cycleFavorite", () => {
     })
     try {
       local.model.cycleFavorite(1)
-      await Bun.sleep(50)
+      await local.model.flush()
 
       const data = await readModelJson()
       expect(data.model.code).toEqual(OPUS)
@@ -427,7 +460,7 @@ describe("edge cases and error handling", () => {
     // Wait for ready
     const deadline = Date.now() + 2000
     while (!local.model.ready && Date.now() < deadline) await Bun.sleep(10)
-    await Bun.sleep(50)
+    await local.model.flush()
 
     try {
       expect(wasReadyBefore).toBe(false)
@@ -450,7 +483,7 @@ describe("edge cases and error handling", () => {
       await Bun.sleep(50)
 
       local.model.set(SONNET, { recent: true })
-      await Bun.sleep(50)
+      await local.model.flush()
 
       expect(local.model.current()).toEqual(SONNET)
       expect(local.model.saved("plan")).toBeUndefined()
@@ -480,7 +513,7 @@ describe("edge cases and error handling", () => {
       expect(local.model.current()).toEqual(OPUS)
 
       local.model.set(OPUS, { recent: true })
-      await Bun.sleep(50)
+      await local.model.flush()
       const data = await readModelJson()
       expect(data.model.code).toBeUndefined()
       expect(data.recent[0]).toEqual(OPUS)
@@ -563,14 +596,14 @@ describe("#9050: configured agent defaults beat stale persisted picks", () => {
         expect(local.model.current()).toEqual(OPUS)
 
         local.model.set(SONNET, { recent: true })
-        await Bun.sleep(50)
+        await local.model.flush()
         expect(local.model.current()).toEqual(SONNET)
         expect(local.model.saved("plan")).toBeUndefined()
 
         local.agent.set("code")
         await Bun.sleep(50)
         local.agent.set("plan")
-        await Bun.sleep(50)
+        await local.model.flush()
         expect(local.model.current()).toEqual(SONNET)
 
         const data = await readModelJson()

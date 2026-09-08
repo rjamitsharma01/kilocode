@@ -1,10 +1,24 @@
 import { Component, For, Show, createEffect, createMemo, createSignal } from "solid-js"
 import { Select } from "@kilocode/kilo-ui/select"
 import { IconButton } from "@kilocode/kilo-ui/icon-button"
+import { Icon } from "@kilocode/kilo-ui/icon"
 
 import { useLanguage } from "../../context/language"
 import type { PermissionConfig, PermissionLevel, PermissionRule, PermissionRuleItem } from "../../types/messages"
-import { effectiveRuleLevel } from "./permission-utils"
+import {
+  addExceptionPatch,
+  clearGroupedPatch,
+  clearWildcardPatch,
+  effectiveConfigLevel,
+  inheritedWildcard,
+  mostRestrictive,
+  permissionExceptions,
+  removeExceptionPatch,
+  setExceptionPatch,
+  setGroupedPatch,
+  setWildcardPatch,
+  type PermissionPatch,
+} from "./permission-utils"
 
 type LevelValue = PermissionLevel | "inherit"
 
@@ -97,49 +111,13 @@ const GROUPED_TOOLS: GroupedToolDef[] = [
     label: "todoread / todowrite",
     descriptionKey: "settings.autoApprove.tool.todoreadwrite",
   },
-  {
-    ids: ["websearch", "codesearch"],
-    label: "websearch / codesearch",
-    descriptionKey: "settings.autoApprove.tool.websearchcodesearch",
-  },
 ]
 
 const TRAILING_TOOLS: ToolDef[] = [
+  { id: "websearch", descriptionKey: "settings.autoApprove.tool.websearch" },
   { id: "webfetch", descriptionKey: "settings.autoApprove.tool.webfetch" },
   { id: "doom_loop", descriptionKey: "settings.autoApprove.tool.doom_loop" },
 ]
-
-const RESTRICTION_ORDER: Record<PermissionLevel, number> = { allow: 0, ask: 1, deny: 2 }
-
-type PermissionPatch = PermissionConfig
-
-function mostRestrictive(levels: PermissionLevel[]): PermissionLevel {
-  return levels.reduce<PermissionLevel>(
-    (best, level) => (RESTRICTION_ORDER[level] > RESTRICTION_ORDER[best] ? level : best),
-    levels[0] ?? "allow",
-  )
-}
-
-function wildcardAction(rule: PermissionRule | undefined, fallback: PermissionLevel): PermissionLevel {
-  if (!rule) return fallback
-  if (typeof rule === "string") return rule
-  if (rule === null) return fallback
-  return rule["*"] ?? fallback
-}
-
-function inheritedWildcard(rule: PermissionRule | undefined): boolean {
-  if (!rule) return true
-  if (typeof rule === "string") return false
-  if (rule === null) return true
-  return rule["*"] === undefined || rule["*"] === null
-}
-
-function exceptions(rule: PermissionRule | undefined): Array<{ pattern: string; action: PermissionLevel }> {
-  if (!rule || typeof rule === "string") return []
-  return Object.entries(rule)
-    .filter(([key, action]) => key !== "*" && action !== null)
-    .map(([pattern, action]) => ({ pattern, action: action as PermissionLevel }))
-}
 
 function toolTitle(id: string): string {
   return id
@@ -157,12 +135,12 @@ const PermissionEditor: Component<{
   description?: string
   component?: string
   inherited?: boolean
+  showDefaultLevel?: boolean
   onChange: (patch: PermissionPatch) => void
 }> = (props) => {
   const perms = createMemo(() => props.permissions ?? {})
 
-  const levelFor = (tool: string): PermissionLevel =>
-    wildcardAction(perms()[tool], effectiveRuleLevel(props.rules, tool))
+  const levelFor = (tool: string): PermissionLevel => effectiveConfigLevel(perms(), tool, props.rules)
 
   const ruleFor = (tool: string): PermissionRule | undefined => perms()[tool]
 
@@ -175,57 +153,32 @@ const PermissionEditor: Component<{
   }
 
   const setGrouped = (ids: string[], level: PermissionLevel) => {
-    const patch: PermissionPatch = {}
-    for (const id of ids) patch[id] = level
-    props.onChange(patch)
+    props.onChange(setGroupedPatch(ids, level))
   }
 
   const clearGrouped = (ids: string[]) => {
-    const patch: PermissionPatch = {}
-    for (const id of ids) patch[id] = null
-    props.onChange(patch)
+    props.onChange(clearGroupedPatch(ids))
   }
 
   const setWildcard = (tool: string, level: PermissionLevel) => {
-    const excs = exceptions(ruleFor(tool))
-    if (excs.length === 0) {
-      props.onChange({ [tool]: level })
-      return
-    }
-    const obj: Record<string, PermissionLevel | null> = { "*": level }
-    for (const exc of excs) obj[exc.pattern] = exc.action
-    props.onChange({ [tool]: obj })
+    props.onChange(setWildcardPatch(ruleFor(tool), tool, level))
   }
 
   const clearWildcard = (tool: string) => {
-    const excs = exceptions(ruleFor(tool))
-    if (excs.length === 0) {
-      props.onChange({ [tool]: null })
-      return
-    }
-    props.onChange({ [tool]: { "*": null } })
+    props.onChange(clearWildcardPatch(ruleFor(tool), tool))
   }
 
   const setException = (tool: string, pattern: string, level: PermissionLevel) => {
-    const current = ruleFor(tool)
-    const base: Record<string, PermissionLevel | null> =
-      typeof current === "string" || current === null ? { "*": current } : { ...(current ?? {}) }
-    base[pattern] = level
-    props.onChange({ [tool]: base })
+    props.onChange(setExceptionPatch(ruleFor(tool), tool, pattern, level))
   }
 
   const addException = (tool: string, pattern: string) => {
-    const current = ruleFor(tool)
-    const base: Record<string, PermissionLevel | null> =
-      typeof current === "string" || current === null ? { "*": current } : { ...(current ?? {}) }
-    base[pattern] = "allow"
-    props.onChange({ [tool]: base })
+    props.onChange(addExceptionPatch(ruleFor(tool), tool, pattern))
   }
 
   const removeException = (tool: string, pattern: string) => {
-    const current = ruleFor(tool)
-    if (!current || typeof current === "string") return
-    props.onChange({ [tool]: { [pattern]: null } })
+    const patch = removeExceptionPatch(ruleFor(tool), tool, pattern)
+    if (patch) props.onChange(patch)
   }
 
   return (
@@ -233,7 +186,7 @@ const PermissionEditor: Component<{
       <Show when={props.description}>
         <div
           style={{
-            "font-size": "12px",
+            "font-size": "var(--kilo-font-size-12)",
             color: "var(--text-weak-base, var(--vscode-descriptionForeground))",
             "padding-bottom": "12px",
             "border-bottom": "1px solid var(--border-weak-base)",
@@ -251,6 +204,7 @@ const PermissionEditor: Component<{
             fallback={levelFor(tool.id)}
             inherited={props.inherited && inheritedWildcard(ruleFor(tool.id))}
             allowInherit={props.inherited}
+            showDefaultLevel={props.showDefaultLevel}
             onWildcardChange={(level) => setWildcard(tool.id, level)}
             onWildcardInherit={() => clearWildcard(tool.id)}
             onExceptionChange={(pattern, level) => setException(tool.id, pattern, level)}
@@ -266,7 +220,8 @@ const PermissionEditor: Component<{
             id={tool.id}
             descriptionKey={tool.descriptionKey}
             level={levelFor(tool.id)}
-            inherited={props.inherited && ruleFor(tool.id) === undefined}
+            inherited={props.inherited && inheritedWildcard(ruleFor(tool.id))}
+            showDefaultLevel={props.showDefaultLevel}
             onChange={(level) => setSimple(tool.id, level)}
             onInherit={() => clearSimple(tool.id)}
           />
@@ -279,7 +234,8 @@ const PermissionEditor: Component<{
             id={group.label}
             descriptionKey={group.descriptionKey}
             level={mostRestrictive(group.ids.map(levelFor))}
-            inherited={props.inherited && group.ids.every((id) => ruleFor(id) === undefined)}
+            inherited={props.inherited && group.ids.every((id) => inheritedWildcard(ruleFor(id)))}
+            showDefaultLevel={props.showDefaultLevel}
             onChange={(level) => setGrouped(group.ids, level)}
             onInherit={() => clearGrouped(group.ids)}
           />
@@ -292,7 +248,8 @@ const PermissionEditor: Component<{
             id={tool.id}
             descriptionKey={tool.descriptionKey}
             level={levelFor(tool.id)}
-            inherited={props.inherited && ruleFor(tool.id) === undefined}
+            inherited={props.inherited && inheritedWildcard(ruleFor(tool.id))}
+            showDefaultLevel={props.showDefaultLevel}
             onChange={(level) => setSimple(tool.id, level)}
             onInherit={() => clearSimple(tool.id)}
           />
@@ -307,6 +264,7 @@ const SimpleToolRow: Component<{
   descriptionKey: string
   level: PermissionLevel
   inherited?: boolean
+  showDefaultLevel?: boolean
   onChange: (level: PermissionLevel) => void
   onInherit?: () => void
 }> = (props) => {
@@ -323,12 +281,12 @@ const SimpleToolRow: Component<{
       }}
     >
       <div style={{ flex: 1, "min-width": 0 }}>
-        <div style={{ "font-size": "13px", color: "var(--text-base, var(--vscode-foreground))" }}>
+        <div style={{ "font-size": "var(--kilo-font-size-13)", color: "var(--text-base, var(--vscode-foreground))" }}>
           {toolTitle(props.id)}
         </div>
         <div
           style={{
-            "font-size": "12px",
+            "font-size": "var(--kilo-font-size-12)",
             color: "var(--text-weak-base, var(--vscode-descriptionForeground))",
             "margin-top": "6px",
           }}
@@ -339,6 +297,7 @@ const SimpleToolRow: Component<{
       <ActionSelect
         level={props.level}
         inherited={props.inherited}
+        showDefaultLevel={props.showDefaultLevel}
         onChange={props.onChange}
         onInherit={props.onInherit}
       />
@@ -352,6 +311,7 @@ const GranularToolRow: Component<{
   fallback: PermissionLevel
   inherited?: boolean
   allowInherit?: boolean
+  showDefaultLevel?: boolean
   onWildcardChange: (level: PermissionLevel) => void
   onWildcardInherit: () => void
   onExceptionChange: (pattern: string, level: PermissionLevel) => void
@@ -361,15 +321,16 @@ const GranularToolRow: Component<{
   const language = useLanguage()
   const [adding, setAdding] = createSignal(false)
   const [input, setInput] = createSignal("")
+  const [override, setOverride] = createSignal<boolean | null>(null)
   let ref: HTMLInputElement | undefined
 
   createEffect(() => {
     if (adding()) ref?.focus()
   })
 
-  const excs = createMemo(() => exceptions(props.rule))
-  const level = createMemo(() => wildcardAction(props.rule, props.fallback))
-
+  const excs = createMemo(() => permissionExceptions(props.rule))
+  const expanded = createMemo(() => override() ?? excs().length <= 5)
+  const toggle = () => setOverride(!expanded())
   const submit = () => {
     const val = input().trim()
     if (val) {
@@ -388,12 +349,12 @@ const GranularToolRow: Component<{
     <div style={{ padding: "12px 0", "border-bottom": "1px solid var(--border-weak-base)" }}>
       <div style={{ display: "flex", gap: "24px", "align-items": "flex-start", "justify-content": "space-between" }}>
         <div style={{ flex: 1, "min-width": 0 }}>
-          <div style={{ "font-size": "13px", color: "var(--text-base, var(--vscode-foreground))" }}>
+          <div style={{ "font-size": "var(--kilo-font-size-13)", color: "var(--text-base, var(--vscode-foreground))" }}>
             {toolTitle(props.tool.id)}
           </div>
           <div
             style={{
-              "font-size": "12px",
+              "font-size": "var(--kilo-font-size-12)",
               color: "var(--text-weak-base, var(--vscode-descriptionForeground))",
               "margin-top": "6px",
             }}
@@ -413,13 +374,14 @@ const GranularToolRow: Component<{
         }}
       >
         <div style={{ flex: 1, "min-width": 0 }}>
-          <div style={{ "font-size": "12px", color: "var(--text-base, #ccc)" }}>
+          <div style={{ "font-size": "var(--kilo-font-size-12)", color: "var(--text-base, #ccc)" }}>
             {language.t(props.tool.granular.wildcardKey)}
           </div>
         </div>
         <ActionSelect
-          level={level()}
+          level={props.fallback}
           inherited={props.inherited}
+          showDefaultLevel={props.showDefaultLevel}
           onChange={props.onWildcardChange}
           onInherit={props.allowInherit ? props.onWildcardInherit : undefined}
         />
@@ -427,57 +389,82 @@ const GranularToolRow: Component<{
 
       <Show when={excs().length > 0}>
         <div style={{ "margin-top": "4px" }}>
-          <div
+          <button
+            type="button"
+            onClick={toggle}
             style={{
-              "font-size": "12px",
+              display: "flex",
+              "align-items": "center",
+              gap: "4px",
+              padding: "0",
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              "font-size": "var(--kilo-font-size-12)",
               color: "var(--text-weak-base, var(--vscode-descriptionForeground))",
               "margin-bottom": "4px",
+              "font-family": "inherit",
             }}
+            aria-expanded={expanded()}
           >
-            {language.t("settings.autoApprove.exceptions")}
-          </div>
-          <For each={excs()}>
-            {(exc) => (
-              <div
-                style={{
-                  display: "flex",
-                  gap: "8px",
-                  "align-items": "center",
-                  padding: "4px 0",
-                  "padding-left": "12px",
-                  "border-top": "1px solid var(--border-weak-base)",
-                }}
-              >
+            <span
+              style={{
+                display: "inline-flex",
+                "align-items": "center",
+                transition: "transform 0.15s ease",
+                transform: expanded() ? "rotate(90deg)" : "rotate(0deg)",
+              }}
+            >
+              <Icon name="chevron-right" size="small" />
+            </span>
+            <span>
+              {language.t("settings.autoApprove.exceptions")} ({excs().length})
+            </span>
+          </button>
+          <Show when={expanded()}>
+            <For each={excs()}>
+              {(exc) => (
                 <div
                   style={{
-                    flex: "1 1 0%",
-                    "min-width": 0,
-                    "font-size": "13px",
-                    "font-family": "var(--vscode-editor-font-family, monospace)",
-                    color: "var(--text-base, #ccc)",
-                    overflow: "hidden",
-                    "text-overflow": "ellipsis",
-                    "white-space": "nowrap",
+                    display: "flex",
+                    gap: "8px",
+                    "align-items": "center",
+                    padding: "4px 0",
+                    "padding-left": "12px",
+                    "border-top": "1px solid var(--border-weak-base)",
                   }}
-                  title={exc.pattern}
                 >
-                  {exc.pattern}
+                  <div
+                    style={{
+                      flex: "1 1 0%",
+                      "min-width": 0,
+                      "font-size": "var(--kilo-font-size-13)",
+                      "font-family": "var(--vscode-editor-font-family, monospace)",
+                      color: "var(--text-base, #ccc)",
+                      overflow: "hidden",
+                      "text-overflow": "ellipsis",
+                      "white-space": "nowrap",
+                    }}
+                    title={exc.pattern}
+                  >
+                    {exc.pattern}
+                  </div>
+                  <div style={{ display: "flex", gap: "4px", "align-items": "center", "flex-shrink": 0 }}>
+                    <ActionSelect
+                      level={exc.action}
+                      onChange={(level: PermissionLevel) => props.onExceptionChange(exc.pattern, level)}
+                    />
+                    <IconButton
+                      variant="ghost"
+                      size="small"
+                      icon="close"
+                      onClick={() => props.onExceptionRemove(exc.pattern)}
+                    />
+                  </div>
                 </div>
-                <div style={{ display: "flex", gap: "4px", "align-items": "center", "flex-shrink": 0 }}>
-                  <ActionSelect
-                    level={exc.action}
-                    onChange={(level: PermissionLevel) => props.onExceptionChange(exc.pattern, level)}
-                  />
-                  <IconButton
-                    variant="ghost"
-                    size="small"
-                    icon="close"
-                    onClick={() => props.onExceptionRemove(exc.pattern)}
-                  />
-                </div>
-              </div>
-            )}
-          </For>
+              )}
+            </For>
+          </Show>
         </div>
       </Show>
 
@@ -493,14 +480,14 @@ const GranularToolRow: Component<{
               background: "none",
               border: "none",
               cursor: "pointer",
-              "font-size": "12px",
+              "font-size": "var(--kilo-font-size-12)",
               color: "var(--text-link-base, #3794ff)",
               "font-family": "inherit",
               "margin-top": "4px",
             }}
             onClick={() => setAdding(true)}
           >
-            <span style={{ "font-size": "14px" }}>+</span>
+            <span style={{ "font-size": "var(--kilo-font-size-14)" }}>+</span>
             {language.t(props.tool.granular.addKey)}
           </button>
         }
@@ -526,7 +513,7 @@ const GranularToolRow: Component<{
               border: "1px solid var(--border-base, #434443)",
               "border-radius": "2px",
               color: "var(--text-base, #ccc)",
-              "font-size": "13px",
+              "font-size": "var(--kilo-font-size-13)",
               "font-family": "var(--vscode-editor-font-family, monospace)",
               padding: "4px 8px",
               outline: "none",
@@ -542,17 +529,23 @@ const GranularToolRow: Component<{
 const ActionSelect: Component<{
   level: PermissionLevel
   inherited?: boolean
+  showDefaultLevel?: boolean
   onChange: (level: PermissionLevel) => void
   onInherit?: () => void
 }> = (props) => {
   const language = useLanguage()
   const opts = createMemo(() => (props.onInherit ? [INHERIT_OPTION, ...LEVEL_OPTIONS] : LEVEL_OPTIONS))
+  const label = (option: LevelOption) => {
+    if (option.value !== "inherit" || !props.showDefaultLevel) return language.t(option.labelKey)
+    const level = LEVEL_OPTIONS.find((item) => item.value === props.level)!
+    return `${language.t(option.labelKey)} (${language.t(level.labelKey)})`
+  }
   return (
     <Select
       options={opts()}
       current={props.inherited ? INHERIT_OPTION : LEVEL_OPTIONS.find((option) => option.value === props.level)}
       value={(option) => option.value}
-      label={(option) => language.t(option.labelKey)}
+      label={label}
       onSelect={(option) => {
         if (!option) return
         if (option.value === "inherit") {
